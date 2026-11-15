@@ -1,0 +1,495 @@
+import * as THREE from 'three';
+import { WEAPON, COLORS } from './config.js';
+import { clamp, damp, lerp } from './util.js';
+
+/**
+ * The rifle. Owns ammo, recoil, spread and the hitscan.
+ *
+ * Spread model (radians, half-angle):
+ *   base + move*clamp(speed) * (crouch? 0.52 : 1) * (ads? 0.34 : 1) + bloom
+ * Bloom is added per shot and decays, so holding the trigger walks the cone open.
+ * Recoil kicks the camera up and drifts sideways; recoilRecover pulls it back.
+ * Both numbers are printed by debugStats() so the tuning is testable, not vibes.
+ */
+export class Weapon {
+  constructor(camera, rng) {
+    this.camera = camera;
+    this.rng = rng;
+    this.name = WEAPON.name;
+
+    this.mag = WEAPON.magSize;
+    this.reserve = WEAPON.startReserve;
+    this.reloading = false;
+    this.reloadTimer = 0;
+    this.cooldown = 0;
+    this.bloom = 0;
+    this.recoilPitch = 0;
+    this.recoilYaw = 0;
+    this.shotsFired = 0;
+    this.shotsHit = 0;
+    this.headshots = 0;
+    this.kills = 0;
+
+    this.adsAmount = 0;
+    this.kick = 0; // viewmodel kick
+    this.kickRot = 0;
+    this.swayX = 0;
+    this.swayY = 0;
+    this.lastFireTime = -99;
+    this.flashTimer = 0;
+    this.triggerDown = false;
+
+    this.raycaster = new THREE.Raycaster();
+    this.raycaster.far = WEAPON.range;
+    this._dir = new THREE.Vector3();
+    this._origin = new THREE.Vector3();
+    this._right = new THREE.Vector3();
+    this._up = new THREE.Vector3();
+    this._muzzleWorld = new THREE.Vector3();
+
+    this.group = this.buildViewModel();
+    this.camera.add(this.group);
+
+    this.tracers = [];
+    this.shells = [];
+    this.impacts = [];
+    this.tracerGeo = new THREE.BufferGeometry();
+    this.impactMax = 28;
+  }
+
+  buildViewModel() {
+    const g = new THREE.Group();
+    const metal = new THREE.MeshStandardMaterial({ color: 0x22282c, roughness: 0.48, metalness: 0.72 });
+    const polymer = new THREE.MeshStandardMaterial({ color: 0x161a1c, roughness: 0.86, metalness: 0.08 });
+    const accent = new THREE.MeshStandardMaterial({ color: 0x2b3a42, roughness: 0.5, metalness: 0.5 });
+    const glow = new THREE.MeshBasicMaterial({ color: COLORS.accent });
+    const glass = new THREE.MeshStandardMaterial({ color: 0x0a2a33, roughness: 0.12, metalness: 0.9, emissive: 0x0b3d4a, emissiveIntensity: 0.8 });
+
+    // receiver
+    const rec = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.11, 0.44), metal);
+    g.add(rec);
+    // upper rail
+    const rail = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.022, 0.4), polymer);
+    rail.position.set(0, 0.062, -0.02);
+    g.add(rail);
+    // handguard
+    const hg = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.09, 0.36), polymer);
+    hg.position.set(0, -0.004, -0.36);
+    g.add(hg);
+    // barrel + muzzle brake
+    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.016, 0.34, 10), metal);
+    barrel.rotation.x = Math.PI / 2;
+    barrel.position.set(0, 0.012, -0.56);
+    g.add(barrel);
+    const brake = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.026, 0.09, 8), accent);
+    brake.rotation.x = Math.PI / 2;
+    brake.position.set(0, 0.012, -0.74);
+    g.add(brake);
+    // magazine (angled)
+    const mag = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.2, 0.1), polymer);
+    mag.position.set(0, -0.14, 0.02);
+    mag.rotation.x = 0.16;
+    g.add(mag);
+    // grip
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.14, 0.07), polymer);
+    grip.position.set(0, -0.1, 0.16);
+    grip.rotation.x = -0.32;
+    g.add(grip);
+    // stock
+    const stock = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.08, 0.22), polymer);
+    stock.position.set(0, -0.01, 0.28);
+    g.add(stock);
+    const cheek = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.03, 0.16), accent);
+    cheek.position.set(0, 0.04, 0.24);
+    g.add(cheek);
+    // optic
+    const opticBody = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, 0.14, 12), metal);
+    opticBody.rotation.x = Math.PI / 2;
+    opticBody.position.set(0, 0.1, -0.05);
+    g.add(opticBody);
+    const lensFront = new THREE.Mesh(new THREE.CircleGeometry(0.028, 16), glass);
+    lensFront.position.set(0, 0.1, -0.121);
+    lensFront.rotation.y = Math.PI;
+    g.add(lensFront);
+    const dotMat = new THREE.MeshBasicMaterial({ color: 0xff4433 });
+    const dot = new THREE.Mesh(new THREE.CircleGeometry(0.0035, 8), dotMat);
+    dot.position.set(0, 0.1, -0.118);
+    dot.rotation.y = Math.PI;
+    g.add(dot);
+    // charging handle detail
+    const ch = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.02, 0.06), accent);
+    ch.position.set(0.055, 0.03, 0.06);
+    g.add(ch);
+    // side glow strip: reads as "armed" in the dark
+    const strip = new THREE.Mesh(new THREE.BoxGeometry(0.002, 0.012, 0.2), glow);
+    strip.position.set(0.044, -0.02, -0.1);
+    g.add(strip);
+
+    // muzzle flash
+    const flashMat = new THREE.MeshBasicMaterial({ color: 0xffd28a, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending });
+    const flash = new THREE.Group();
+    const core = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 6), flashMat);
+    flash.add(core);
+    for (let i = 0; i < 4; i++) {
+      const spike = new THREE.Mesh(new THREE.ConeGeometry(0.016, 0.1, 5), flashMat);
+      spike.rotation.z = Math.PI / 2;
+      spike.rotation.x = (i / 4) * Math.PI * 2;
+      spike.position.set(0, 0, -0.04);
+      spike.translateY(0.02);
+      flash.add(spike);
+    }
+    flash.position.set(0, 0.012, -0.8);
+    g.add(flash);
+    this.flashGroup = flash;
+    this.flashMat = flashMat;
+
+    const muzzleLight = new THREE.PointLight(0xffc074, 0, 9, 2);
+    muzzleLight.position.set(0, 0.012, -0.8);
+    g.add(muzzleLight);
+    this.muzzleLight = muzzleLight;
+
+    g.position.set(0.24, -0.22, -0.42);
+    g.rotation.set(0.02, 0.06, 0.0);
+    g.scale.setScalar(1.0);
+    g.renderOrder = 10;
+    this._hipPos = new THREE.Vector3(0.24, -0.22, -0.42);
+    this._adsPos = new THREE.Vector3(0.0, -0.128, -0.3);
+    return g;
+  }
+
+  get ammoText() {
+    return `${this.mag} / ${this.reserve}`;
+  }
+
+  get isEmpty() {
+    return this.mag <= 0;
+  }
+
+  canFire() {
+    return !this.reloading && this.mag > 0 && this.cooldown <= 0;
+  }
+
+  /** Current cone half-angle in radians for this exact frame. */
+  currentSpread(player) {
+    const speedFactor = clamp(player.speed / 5.2, 0, 1.35);
+    const stance = player.crouchAmount >= 0.5 ? WEAPON.spreadCrouchMul : 1;
+    const adsMul = this.adsAmount > 0.5 ? WEAPON.spreadAdsMul : 1;
+    return WEAPON.spreadBase + WEAPON.spreadMove * speedFactor * stance * adsMul + this.bloom;
+  }
+
+  startReload() {
+    if (this.reloading || this.mag >= WEAPON.magSize || this.reserve <= 0) return false;
+    this.reloading = true;
+    this.reloadTimer = WEAPON.reloadTime;
+    return true;
+  }
+
+  reloadStep(dt) {
+    if (!this.reloading) return false;
+    this.reloadTimer -= dt;
+    if (this.reloadTimer <= 0) {
+      const need = WEAPON.magSize - this.mag;
+      const take = Math.min(need, this.reserve);
+      this.mag += take;
+      this.reserve -= take;
+      this.reloading = false;
+      return true; // finished
+    }
+    return false;
+  }
+
+  /**
+   * Hitscan one round.
+   * @returns {{hit:boolean, part?:string, point?:THREE.Vector3, killed?:boolean, target?:Enemy}}
+   */
+  fire(player, enemies, colliders) {
+    if (!this.canFire()) return { hit: false, dry: this.mag <= 0 };
+
+    this.mag--;
+    this.shotsFired++;
+    this.cooldown = 60 / WEAPON.rpm;
+    this.lastFireTime = 0;
+    this.triggerDown = true;
+
+    // ---- aim direction with spread cone ----
+    const spread = this.currentSpread(player);
+    player.aimDirection(this._dir);
+    // Build a basis around the aim direction, then offset inside the cone.
+    this._up.set(0, 1, 0);
+    this._right.crossVectors(this._dir, this._up).normalize();
+    if (this._right.lengthSq() < 1e-6) this._right.set(1, 0, 0);
+    this._up.crossVectors(this._right, this._dir).normalize();
+
+    const radius = Math.tan(spread) * 1.0;
+    const ang = this.rng.next() * Math.PI * 2;
+    const mag = radius * Math.sqrt(this.rng.next());
+    const ox = Math.cos(ang) * mag;
+    const oy = Math.sin(ang) * mag;
+
+    const dir = this._dir.clone()
+      .addScaledVector(this._right, ox)
+      .addScaledVector(this._up, oy)
+      .normalize();
+
+    // ---- origin: camera, nudged to the muzzle so close cover behaves ----
+    this.camera.getWorldPosition(this._origin);
+    this.group.localToWorld(this._muzzleWorld.set(0, 0.012, -0.8));
+    const origin = this._origin.clone();
+    // Blend 35% toward the muzzle to avoid shooting through the gun model.
+    origin.lerp(this._muzzleWorld, 0.0);
+    origin.y -= 0.04;
+
+    this.raycaster.set(origin, dir);
+    this.raycaster.far = WEAPON.range;
+
+    // ---- gather targets ----
+    const meshes = [];
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      e.mesh.updateMatrixWorld(true);
+      for (const h of e.hitboxes) meshes.push(h);
+    }
+
+    // ---- world blocks ----
+    const worldHits = [];
+    for (const c of colliders) {
+      const box = new THREE.Box3(
+        new THREE.Vector3(c.minX, c.minY, c.minZ),
+        new THREE.Vector3(c.maxX, c.maxY, c.maxZ)
+      );
+      const hitPoint = new THREE.Vector3();
+      if (this.raycaster.ray.intersectBox(box, hitPoint)) {
+        const d = hitPoint.distanceTo(origin);
+        if (d <= WEAPON.range) worldHits.push({ point: hitPoint.clone(), dist: d });
+      }
+    }
+    worldHits.sort((a, b) => a.dist - b.dist);
+    const worldDist = worldHits.length ? worldHits[0].dist : Infinity;
+
+    const hits = this.raycaster.intersectObjects(meshes, false);
+    const first = hits.length ? hits[0] : null;
+    const firstDist = first ? first.distance : Infinity;
+
+    this.addRecoilKick(player, spread);
+    this.spawnMuzzleEffects(origin, dir);
+
+    if (first && firstDist < worldDist) {
+      const enemy = first.object.userData.enemy;
+      const part = first.object.userData.part;
+      const mul = first.object.userData.mul ?? 1;
+      const dist = firstDist;
+
+      // Distance falloff beyond falloffStart.
+      let falloff = 1;
+      if (dist > WEAPON.falloffStart) {
+        const t = clamp((dist - WEAPON.falloffStart) / (WEAPON.falloffEnd - WEAPON.falloffStart), 0, 1);
+        falloff = lerp(1, WEAPON.falloffMin, t);
+      }
+      const dmg = WEAPON.damage * mul * falloff;
+      const res = enemy.takeDamage(dmg, part);
+
+      this.shotsHit++;
+      if (part === 'head') this.headshots++;
+      if (res.killed) this.kills++;
+
+      this.addTracer(this._muzzleWorld.clone(), first.point.clone(), true);
+      this.spawnImpact(first.point, first.face ? first.face.normal : dir.clone().negate(), true);
+      return { hit: true, part, point: first.point.clone(), killed: res.killed, target: enemy, damage: dmg };
+    }
+
+    // Wall hit or clean miss.
+    if (worldHits.length) {
+      const p = worldHits[0];
+      this.addTracer(this._muzzleWorld.clone(), p.point.clone(), false);
+      this.spawnImpact(p.point, dir.clone().negate(), false);
+    } else {
+      const end = origin.clone().addScaledVector(dir, WEAPON.range);
+      this.addTracer(this._muzzleWorld.clone(), end, false);
+    }
+    return { hit: false, point: worldHits.length ? worldHits[0].point.clone() : null };
+  }
+
+  addRecoilKick(player, spread) {
+    // Recoil grows with the cone: spraying makes the next shot worse.
+    const scale = 0.7 + spread * 6.0;
+    const pitch = WEAPON.recoilPitch * scale;
+    const yaw = WEAPON.recoilYaw * this.rng.range(-1.6, 1.6) * scale;
+    this.recoilPitch = Math.min(WEAPON.recoilMax, this.recoilPitch + pitch);
+    this.recoilYaw = clamp(this.recoilYaw + yaw, -WEAPON.recoilMax, WEAPON.recoilMax);
+    player.addRecoil(pitch * 0.85, yaw * 0.5);
+
+    this.bloom = Math.min(WEAPON.bloomMax, this.bloom + WEAPON.bloomPerShot);
+    this.kick = 1;
+    this.kickRot = 1;
+    this.flashTimer = 2;
+  }
+
+  spawnMuzzleEffects(origin, dir) {
+    void dir;
+    this.flashMat.opacity = 1;
+    this.muzzleLight.intensity = 18;
+    this.flashGroup.rotation.z = this.rng.next() * Math.PI * 2;
+
+    // Ejected brass: small box with a little spin, removed after it falls.
+    const shellMat = new THREE.MeshStandardMaterial({ color: 0xb98a2e, roughness: 0.35, metalness: 0.85 });
+    const shell = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.018, 0.045), shellMat);
+    this.group.localToWorld(shell.position.set(0.05, -0.01, 0.05));
+    shell.rotation.set(this.rng.next(), this.rng.next(), this.rng.next());
+    shell.userData.vel = new THREE.Vector3(
+      this.rng.range(0.9, 1.7),
+      this.rng.range(0.6, 1.2),
+      this.rng.range(0.2, 0.7)
+    );
+    shell.userData.spin = new THREE.Vector3(this.rng.range(-14, 14), this.rng.range(-14, 14), this.rng.range(-14, 14));
+    shell.userData.life = 1.4;
+    this.camera.parent?.add(shell);
+    shell.position.copy(this._muzzleWorld);
+    shell.position.y -= 0.03;
+    this.shells.push(shell);
+    void origin;
+  }
+
+  addTracer(from, to, hit) {
+    const geo = new THREE.BufferGeometry().setFromPoints([from.clone(), to.clone()]);
+    const mat = new THREE.LineBasicMaterial({
+      color: hit ? 0xfff0c0 : 0xffd08a,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+    });
+    const line = new THREE.Line(geo, mat);
+    line.userData.life = 0.07;
+    line.userData.maxLife = 0.07;
+    this.tracerHolder = this.tracerHolder || this.camera.parent;
+    this.tracerHolder?.add(line);
+    this.tracers.push(line);
+  }
+
+  spawnImpact(point, normal, onBody) {
+    const mat = new THREE.MeshBasicMaterial({
+      color: onBody ? 0xff4d3a : 0xffe1a8,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const size = onBody ? 0.06 : 0.09;
+    const q = new THREE.Mesh(new THREE.PlaneGeometry(size, size), mat);
+    q.position.copy(point);
+    if (normal.lengthSq() > 0.001) q.lookAt(point.clone().add(normal));
+    q.userData.life = 0.5;
+    q.userData.maxLife = 0.5;
+    this.impactHolder = this.impactHolder || this.camera.parent;
+    this.impactHolder?.add(q);
+    this.impacts.push(q);
+
+    // Trim old impacts so a long fight cannot bloat the scene.
+    while (this.impacts.length > this.impactMax) {
+      const old = this.impacts.shift();
+      old.parent?.remove(old);
+      old.geometry.dispose();
+      old.material.dispose();
+    }
+  }
+
+  update(dt, player, input) {
+    // Timers.
+    this.cooldown = Math.max(0, this.cooldown - dt);
+    this.bloom = Math.max(0, this.bloom - WEAPON.bloomDecay * dt);
+    this.recoilPitch = damp(this.recoilPitch, 0, WEAPON.recoilRecover, dt);
+    this.recoilYaw = damp(this.recoilYaw, 0, WEAPON.recoilRecover, dt);
+    this.kick = damp(this.kick, 0, 14, dt);
+    this.kickRot = damp(this.kickRot, 0, 11, dt);
+    this.flashTimer = Math.max(0, this.flashTimer - dt * 16);
+    this.flashMat.opacity = this.flashTimer > 0.6 ? 1 : Math.max(0, (this.flashTimer - 0.2) / 0.4);
+    this.muzzleLight.intensity = this.flashTimer > 0 ? 18 * this.flashTimer : 0;
+
+    const reloadDone = this.reloadStep(dt);
+    if (reloadDone) this.onReloadDone?.();
+
+    // ADS blend.
+    this.adsAmount = damp(this.adsAmount, input.ads && !this.reloading ? 1 : 0, 13, dt);
+    const ads = this.adsAmount;
+
+    // Viewmodel pose: hip -> optic line, plus bob and sway.
+    const speedFactor = clamp(player.speed / WEAPON.spreadBase, 0, 1);
+    void speedFactor;
+    const sway = Math.sin(player.bobPhase) * 0.006;
+    const swayY = Math.cos(player.bobPhase * 2) * 0.004;
+    this.swayX = damp(this.swayX, sway * (1 - ads * 0.6), 8, dt);
+    this.swayY = damp(this.swayY, swayY * (1 - ads * 0.7), 8, dt);
+
+    const px = lerp(this._hipPos.x, this._adsPos.x, ads) + this.swayX;
+    const py = lerp(this._hipPos.y, this._adsPos.y, ads) + this.swayY - this.kick * 0.012;
+    const pz = lerp(this._hipPos.z, this._adsPos.z, ads) + this.kick * 0.05;
+    this.group.position.set(px, py, pz);
+    this.group.rotation.x = lerp(0.02, 0.0, ads) + this.kickRot * 0.06;
+    this.group.rotation.y = lerp(0.06, 0.0, ads) + this.swayX * 1.5;
+    this.group.rotation.z = lerp(0.0, 0.0, ads) + this.swayX * 2.0;
+
+    // Reload animation: drop the muzzle and roll the rifle.
+    if (this.reloading) {
+      const t = 1 - this.reloadTimer / WEAPON.reloadTime;
+      const dip = Math.sin(clamp(t, 0, 1) * Math.PI);
+      this.group.position.y -= dip * 0.11;
+      this.group.rotation.x += dip * 0.55;
+      this.group.rotation.z += dip * 0.3;
+    }
+
+    // Effects lifetimes.
+    for (let i = this.tracers.length - 1; i >= 0; i--) {
+      const l = this.tracers[i];
+      l.userData.life -= dt;
+      l.material.opacity = Math.max(0, l.userData.life / l.userData.maxLife) * 0.85;
+      if (l.userData.life <= 0) {
+        l.parent?.remove(l);
+        l.geometry.dispose();
+        l.material.dispose();
+        this.tracers.splice(i, 1);
+      }
+    }
+
+    for (let i = this.impacts.length - 1; i >= 0; i--) {
+      const q = this.impacts[i];
+      q.userData.life -= dt;
+      q.material.opacity = Math.max(0, q.userData.life / q.userData.maxLife) * 0.95;
+      if (q.userData.life <= 0) {
+        q.parent?.remove(q);
+        q.geometry.dispose();
+        q.material.dispose();
+        this.impacts.splice(i, 1);
+      }
+    }
+
+    for (let i = this.shells.length - 1; i >= 0; i--) {
+      const s = this.shells[i];
+      s.userData.life -= dt;
+      const v = s.userData.vel;
+      v.y -= 9.8 * dt;
+      s.position.addScaledVector(v, dt);
+      s.rotation.x += s.userData.spin.x * dt;
+      s.rotation.y += s.userData.spin.y * dt;
+      s.rotation.z += s.userData.spin.z * dt;
+      if (s.userData.life <= 0 || s.position.y < -3) {
+        s.parent?.remove(s);
+        s.geometry.dispose();
+        s.material.dispose();
+        this.shells.splice(i, 1);
+      }
+    }
+  }
+
+  /** Snapshot for the HUD and for the debug readout. */
+  debugStats(player) {
+    return {
+      mag: this.mag,
+      reserve: this.reserve,
+      spreadDeg: +((this.currentSpread(player) * 180) / Math.PI).toFixed(3),
+      moveSpreadDeg: +(((WEAPON.spreadMove * clamp(player.speed / 5.2, 0, 1.35) * 180) / Math.PI).toFixed(3)),
+      bloomDeg: +(((this.bloom * 180) / Math.PI).toFixed(3)),
+      recoilPitch: +this.recoilPitch.toFixed(4),
+      accuracy: this.shotsFired ? +(this.shotsHit / this.shotsFired).toFixed(3) : 0,
+      headshots: this.headshots,
+    };
+  }
+}

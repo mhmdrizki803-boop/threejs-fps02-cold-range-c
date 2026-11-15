@@ -1,0 +1,11 @@
+import { chromium } from 'playwright';
+const b = await chromium.launch({ args: ['--use-gl=swiftshader','--enable-unsafe-swiftshader','--no-sandbox'] });
+const p = await b.newPage({ viewport:{width:800,height:450} });
+p.on('pageerror',e=>console.log('PAGEERR',e.message));
+await p.goto('http://127.0.0.1:8777/game/index.html');
+await p.waitForFunction(()=>window.__fps);
+console.log('before click:', await p.evaluate(()=>({keys:Object.keys(window.__fps||{}), hasGame: !!window.__fps?.game, url:location.href})));
+await p.click('#play');
+await p.waitForTimeout(500);
+console.log('after click:', await p.evaluate(()=>({keys:Object.keys(window.__fps||{}), hasGame: !!window.__fps?.game, gameType: typeof window.__fps?.game, url:location.href, state: window.__fps?.game?.state})));
+await b.close();
