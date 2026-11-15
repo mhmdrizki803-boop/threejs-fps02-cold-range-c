@@ -47,6 +47,10 @@ const DAMAGE_HEAD = 34; // one headshot is not a kill: two are
 const DAMAGE_BODY = 17;
 const SCORE_TICK = 10; // one point per ten seconds survived
 const SPAWN_SHIELD = 2.0; // seconds of immunity at the top of a round
+/* Difficulty lever, kept here so the shooter module's own tuning stays intact:
+ * six hostiles firing 8-14 damage at once is a 60 dps wall, which is not a
+ * fight. Scaled to a third, a burst costs ~3-5 HP instead of 11. */
+const INCOMING_DAMAGE_MUL = 0.35;
 const MAX_PITCH = (85 * Math.PI) / 180; // ±85 degrees, never past vertical
 const SENSITIVITY = 0.0022; // radians per pixel of mouse travel
 const FOV_HIP = 76;
@@ -68,7 +72,7 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0; // neutral: the yard is lit, not graded
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = THREE.PCFShadowMap;
 
 const camera = new THREE.PerspectiveCamera(
   FOV_HIP,
@@ -279,6 +283,7 @@ function updateSparks(dt) {
  * counts, so a hostile behind a crate is safe and a wall stops the bullet.
  */
 function fireShot() {
+  if (mode.value !== 'playing') return; // no shots on a menu or an end screen
   if (!weapon.canFire()) {
     if (weapon.mag === 0) weapon.reload(); // dry click pulls a fresh mag
     return;
@@ -399,6 +404,7 @@ function endRound(win, reason) {
   if (document.exitPointerLock) document.exitPointerLock();
 
   hud.setScore(score);
+  setHostiles(0);
   hud.onPlay = () => startRound();
 
   const survived = elapsed.toFixed(1);
@@ -558,8 +564,8 @@ const bodyDamage = player.damage.bind(player); // the body's own health bookkeep
 player.hurt = (amount) => {
   if (mode.value !== 'playing') return;
   if (shield > 0) return; // spawn shield: no damage in the first two seconds
-  bodyDamage(amount);
-  hurtFlash = Math.max(hurtFlash, Math.min(1, 0.4 + amount / 60));
+  bodyDamage(amount * INCOMING_DAMAGE_MUL);
+  hurtFlash = Math.max(hurtFlash, Math.min(1, 0.35 + (amount * INCOMING_DAMAGE_MUL) / 30));
 };
 
 /* ──────────────────────────────────────────────────────────────── frame ─ */
@@ -694,6 +700,6 @@ window.__fps = {
     syncCamera(0.016);
     const before = bot.health;
     fireShot();
-    return { before, after: bot.health, alive: bot.alive };
+    return { before, after: bot.health, alive: bot.alive, mode: mode.value };
   },
 };
