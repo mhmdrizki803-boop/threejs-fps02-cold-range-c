@@ -18,9 +18,15 @@
  *      overlay carries the score and one button that resets everything.
  *   3. The frame loop at the bottom — clamped delta (~50 ms ceiling, so a tab
  *      hitch cannot teleport bodies through walls), simulation, then render.
+ * Two numbers at the top of this file are the ones worth arguing about:
+ * SPAWN_SHIELD (2 s before hostiles can hurt you) and INCOMING_DAMAGE_MUL
+ * (0.35 — six hostiles firing the shooter module's raw 8-14 per shot is a
+ * 60 dps wall, which reads as an instant loss rather than a fight).
  *
  * Controls: WASD move, Shift sprint, C or Control crouch, Space jump,
  * R reload, left mouse fire, right mouse aim, Esc releases the pointer.
+ * The mouse is captured on the start button and on any click on the canvas;
+ * losing the capture mid-round pauses instead of letting you fight blind.
  * Module map: world.js (arena) · player.js (body/collision) · shooters.js (AI)
  * · weapon.js (rifle + cone) · hud.js (DOM). This file is the hub that wires
  * them into one round.
@@ -164,7 +170,6 @@ hud.setHealth(100, 100);
 hud.setAmmo(weapon.mag, weapon.reserve);
 hud.setTimer(ROUND_SECONDS);
 hud.setScore(0);
-hud.setWave(1, 1);
 
 /* The wave panel is repurposed for the thing that actually matters this round. */
 const waveValue = document.getElementById('wave-value');
@@ -314,7 +319,8 @@ function fireShot() {
       kills += 1;
       hud.setMessage(botHit.isHead ? 'HEADSHOT — HOSTILE DOWN' : 'HOSTILE DOWN', 'kill');
     } else {
-      hud.setMessage(botHit.isHead ? 'HEADSHOT' : `HIT  ${Math.round(amount)}`, botHit.isHead ? 'crit' : 'hit');
+      const label = botHit.isHead ? 'HEADSHOT' : `HIT  ${Math.round(amount)}`;
+      hud.setMessage(label, botHit.isHead ? 'crit' : 'hit');
     }
     return;
   }
@@ -413,13 +419,15 @@ function endRound(win, reason) {
     : reason === 'time'
       ? 'TIME EXPIRED'
       : 'YOU ARE DOWN';
-  const copy = win
-    ? `All ${shooters.list.length} hostiles down with ${Math.ceil(timeLeft)}s left on the clock.\n\n` +
-      `Final score ${score}  ·  kills ${kills}  ·  survived ${survived}s\n` +
-      `Accuracy ${accuracyText()}  ·  headshots ${headshots}`
-    : `${reason === 'time' ? 'The clock ran dry before the yard was clear.' : 'You took one too many rounds in the open.'}\n\n` +
-      `Final score ${score}  ·  kills ${kills}  ·  survived ${survived}s\n` +
-      `Accuracy ${accuracyText()}  ·  headshots ${headshots}`;
+  const headline = win
+    ? `All ${shooters.list.length} hostiles down with ${Math.ceil(timeLeft)}s left on the clock.`
+    : reason === 'time'
+      ? 'The clock ran dry before the yard was clear.'
+      : 'You took one too many rounds in the open.';
+  const stats =
+    `Final score ${score}  ·  kills ${kills}  ·  survived ${survived}s\n` +
+    `Accuracy ${accuracyText()}  ·  headshots ${headshots}`;
+  const copy = `${headline}\n\n${stats}`;
 
   hud.showEnd(head, copy, {
     win,
