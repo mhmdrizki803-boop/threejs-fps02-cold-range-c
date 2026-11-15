@@ -410,7 +410,7 @@ function endRound(win, reason) {
   if (document.exitPointerLock) document.exitPointerLock();
 
   hud.setScore(score);
-  setHostiles(0);
+  setHostiles(shooters.aliveCount());
   hud.onPlay = () => startRound();
 
   const survived = elapsed.toFixed(1);
